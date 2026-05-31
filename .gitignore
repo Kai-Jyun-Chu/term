@@ -48,7 +48,7 @@ data/
 *.tar
 *.tar.gz
 *.7z
-
+*.npy
 # Local environment files
 .env
 .env.*

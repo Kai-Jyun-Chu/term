@@ -26,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weights", default="yolov8n.pt", help="YOLOv8 checkpoint path or model name.")
     parser.add_argument("--imgsz", type=int, default=640, help="Input image size used for graph tracing.")
     parser.add_argument("--ratio", type=float, default=0.10, help="Channel pruning ratio, e.g. 0.10 for 10%.")
+    parser.add_argument("--round-to", type=int, default=1, help="Round pruned channel counts to this multiple.")
+    parser.add_argument("--local-pruning", action="store_true", help="Prune the ratio from each layer instead of globally.")
     parser.add_argument("--device", default="", help="cuda, cpu, or empty for auto.")
     parser.add_argument("--output", default="yolov8n_pruned_sample.pt", help="Output checkpoint path.")
     return parser.parse_args()
@@ -118,6 +120,48 @@ def replace_c2f_with_c2fv2(module: nn.Module) -> None:
             replace_c2f_with_c2fv2(child)
 
 
+def unique_modules(modules: list[nn.Module]) -> list[nn.Module]:
+    """Return modules in original order without duplicates."""
+    unique = []
+    seen = set()
+    for module in modules:
+        module_id = id(module)
+        if module_id not in seen:
+            unique.append(module)
+            seen.add(module_id)
+    return unique
+
+
+def collect_sensitive_layers(model: nn.Module) -> tuple[list[nn.Module], list[str]]:
+    """Collect layers that should be protected during pruning.
+
+    For YOLO, the first stem layer and the final neck outputs feeding Detect are
+    especially sensitive. Protecting them keeps the detector interface more
+    stable while global pruning chooses less important channels elsewhere.
+    """
+    layers = getattr(model, "model", None)
+    has_indexed_layers = isinstance(layers, (nn.ModuleList, nn.Sequential))
+    protected: list[nn.Module] = []
+    descriptions: list[str] = []
+
+    if has_indexed_layers and len(layers) > 0:
+        protected.append(layers[0])
+        descriptions.append("layer 0 first stem")
+
+    for module in model.modules():
+        if isinstance(module, Detect):
+            protected.append(module)
+            descriptions.append("Detect head")
+
+            if has_indexed_layers:
+                for source_idx in module.f:
+                    source = layers[source_idx]
+                    protected.append(source)
+                    descriptions.append(f"layer {source_idx} Detect input/final neck output")
+
+    return unique_modules(protected), descriptions
+
+
 def main() -> None:
     args = parse_args()
     device = select_device(args.device)
@@ -144,23 +188,31 @@ def main() -> None:
     base_macs, base_params = count_model(model, example_inputs)
     print(f"Before pruning: {base_params / 1e6:.2f}M params, {base_macs / 1e9:.2f}G MACs")
 
-    # Keep the detection head untouched for this first experiment. YOLO heads have
-    # task-specific output shapes, so pruning them is easier to break accidentally.
-    ignored_layers = [module for module in model.modules() if isinstance(module, Detect)]
+    # Keep sensitive layers untouched: Detect, Detect input layers/final neck
+    # outputs, and the first stem layer.
+    sensitive_layers, sensitive_descriptions = collect_sensitive_layers(model)
+    ignored_layers = sensitive_layers
+    pruning_ratio_dict = {module: 0.0 for module in sensitive_layers}
+    print("Protected layers:")
+    for description in sensitive_descriptions:
+        print(f"  - {description}")
 
     # Magnitude importance removes channels with smaller weight norms first.
     importance = tp.importance.MagnitudeImportance(p=2)
 
-    # MetaPruner removes channels and also updates dependent layers.
-    # For a tiny first experiment, avoid channel rounding. With YOLOv8n and a
-    # small ratio like 10%, round_to=8 can round the prune count down to zero.
+    # MetaPruner removes channels and also updates dependent layers. Global
+    # pruning is safer for very small ratios: local pruning can remove one
+    # channel from almost every layer, which often collapses pretrained
+    # detection confidence before finetuning.
     pruner = tp.pruner.MetaPruner(
         model,
         example_inputs,
         importance=importance,
         pruning_ratio=args.ratio,
+        pruning_ratio_dict=pruning_ratio_dict,
         ignored_layers=ignored_layers,
-        global_pruning=False,
+        global_pruning=not args.local_pruning,
+        round_to=args.round_to,
     )
 
     print(f"Pruning {args.ratio:.0%} of prunable channels...")
